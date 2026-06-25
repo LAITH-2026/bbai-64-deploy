@@ -1,0 +1,22 @@
+# Runtime overrides (board). Optional — app.py falls back to config.py defaults
+# (which also read BBAI64_* env vars). Edit to match your CARLA broker.
+
+mqtt:
+  broker: 127.0.0.1
+  port: 1883
+  topic_frames: carla/camera/front   # JPEG frames in
+  topic_adas: adas/alerts            # ADAS alerts out (Qt infotainment)
+
+display: imshow        # imshow | none  (live preview only; saved outputs are source-driven)
+
+depth: true            # Depth-Anything-V2 per-object distance. false => YOLO+UFLD only.
+                       # (app.py --no-depth also disables it and wins over this.)
+
+# Object-detection operating point. All optional — omit to use config.py defaults
+# (conf_default 0.40, per_class pedestrian 0.15, iou 0.45). per_class keys are
+# class names from the model's data.yaml.
+thresholds:
+  iou: 0.45
+  conf_default: 0.40
+  per_class:
+    pedestrian: 0.15

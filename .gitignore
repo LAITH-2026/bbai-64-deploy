@@ -1,0 +1,24 @@
+# ── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── Produced on the PC compile stage / on the board (not source) ──
+bbai64-deploy/artifacts/        # ONNX + INT8 TIDL artifacts (version-locked to firmware)
+bbai64-deploy/calib/            # calibration frames extracted from a CARLA clip
+bbai64-deploy/runtime/runtime_kpis.csv
+bbai64-deploy/runtime/runtime_analytics.txt
+*.onnx
+
+# ── Large model weights — fetched separately, never committed ──
+# culane_res18.pth is ~825 MB (over GitHub's 100 MB limit). best.pt (15 MB) IS
+# committed (it is the deployable fine-tuned model). See README "Lane checkpoint".
+Ultra-Fast-Lane-Detection-v2/*.pth
+
+# ── OS / editor cruft ──
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

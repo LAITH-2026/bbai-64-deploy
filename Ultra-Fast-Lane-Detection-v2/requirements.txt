@@ -1,0 +1,9 @@
+flask>=2.0,<3
+opencv-python
+tqdm
+tensorboard
+addict
+scikit-learn
+pathspec
+imagesize
+ujson

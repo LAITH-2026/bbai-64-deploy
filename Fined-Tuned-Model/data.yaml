@@ -1,0 +1,6 @@
+path: /kaggle/input/datasets/makeenkhattab/dataset-after-balancing-augmentation/MERGED
+train: images/train
+val: images/val
+test: images/test
+nc: 8
+names: ['vehicle','bike','motobike','traffic_light','pedestrian','sign_30','sign_60','sign_90']
