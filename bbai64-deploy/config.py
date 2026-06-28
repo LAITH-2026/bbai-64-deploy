@@ -180,60 +180,82 @@ class UFLD:
 
 
 # ─────────────────────────────────────────────────────────────
-# Depth-Anything-V2 (monocular METRIC depth) — per-object distance in metres
-# Ported from Integrate-Features/integrate.py. The Metric-Outdoor-Small head is
-# VKITTI-trained and returns absolute metres (0..~80 m) — the right scale for
-# CARLA driving scenes. On the board it is the THIRD model time-sharing the one
-# C7x, so combined latency = yolo + ufld + depth (serial; see README).
+# DEPTH — per-object metric distance (metres) by CLOSED-FORM MONOCULAR GEOMETRY.
 #
-# ⚠️ Depth-Anything-V2 is a ViT/DINOv2 transformer + DPT head. TIDL transformer
-# support is version-dependent and ViTs are quantization-sensitive — this is the
-# riskiest model to offload. The compile script will report which layers land on
-# the A72; if INT8 accuracy is poor, bump DEPTH.TENSOR_BITS to 16 (per-model, set
-# below) or BBAI64_DEPTH_BITS=16. The runtime CPUExecutionProvider catches any
-# subgraph TIDL won't take, so it always runs — just possibly slower.
+# This REPLACES the Depth-Anything-V2 ViT. That model is a DINOv2 ViT-S/14 encoder
+# + DPT dense head; TIDL on this SDK (~09.02) only validates classification ViTs,
+# not the DPT dense-prediction head / attention / LayerNorm / GELU ops — so the
+# whole encoder fell back to the A72 and ran at seconds-per-frame. The runtime only
+# ever needed ONE scalar distance per YOLO box (the `depth_m` ADAS field), so the
+# dense map is unnecessary: we compute that scalar from the known CARLA camera
+# geometry. No network, no ONNX, no C7x load — it runs on the A72 in microseconds
+# and FREES the accelerator (combined C7x latency drops to yolo + ufld).
+#
+# Two estimators, routed per detection class (see runtime/depth_runtime.py):
+#   • Ground-plane / IPM  — box BOTTOM is the road-contact point (vehicles, bikes,
+#     pedestrians). Back-project the bottom pixel onto the flat ground plane:
+#         Z = H·(cosδ − y_n·sinδ)/(y_n·cosδ + sinδ),   y_n = (v_bottom − cy)/fy
+#     (δ = pitch; δ = 0 ⇒ the textbook  Z = H·fy/(v_bottom − cy)).
+#   • Known-size pinhole  — OFF-ground objects (lights, speed signs) and clipped
+#     boxes:   Z = fy · H_real[class] / h_px.
+# Intrinsics are derived per-frame from the actual frame size + FOV, so they track
+# the incoming MQTT resolution automatically. Calibrate CAM_HEIGHT_M / PITCH_DEG /
+# CLASS_DIMS against CARLA's ground-truth depth sensor.
 # ─────────────────────────────────────────────────────────────
 class DEPTH:
-    # On by default (mirrors integrate.py); disable with app.py --no-depth or
-    # runtime/config.yaml `depth: false`. Off => YOLO+UFLD only, leaner pipeline.
+    # On by default; disable with app.py --no-depth or runtime/config.yaml
+    # `depth: false`. Off => YOLO+UFLD only (no per-object distance).
     ENABLED = os.environ.get("BBAI64_DEPTH", "1") not in ("0", "false", "False")
 
-    # HF checkpoint — used by the PC export step ONLY (torch/transformers there);
-    # the board consumes the compiled ONNX/TIDL artifacts, never this id.
-    HF_MODEL_ID = os.environ.get(
-        "BBAI64_DEPTH_MODEL",
-        "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf")
-    ONNX = ARTIFACTS / "depth_anything_v2_metric_s.onnx"
-    TIDL_DIR = ARTIFACTS / "depth_tidl"
+    # Identifies the depth method in the JSON/MQTT payload and logs.
+    METHOD = "geometric-monocular (IPM ground-plane + known-size pinhole)"
 
-    # DINOv2 ViT-S/14 wants a side that is a multiple of 14; 518 = 14*37 is the
-    # checkpoint's native working size. Fixed (static) for a clean TIDL graph.
-    INPUT_SIZE = int(os.environ.get("BBAI64_DEPTH_SIZE", "518"))
-    IN_SHAPE = (1, 3, INPUT_SIZE, INPUT_SIZE)
-    IN_NAME = "pixel_values"          # transformers' depth-estimation input name
-    OUT_NAME = "predicted_depth"
+    # ── Camera (CARLA front RGB) ───────────────────────────────
+    # CARLA's `fov` is the HORIZONTAL field of view in degrees (sensor default 90).
+    # Intrinsics derive from it + the live frame size: fx = fy = W/(2·tan(FOV/2)),
+    # cx = W/2, cy = H/2 (CARLA pinhole, no lens distortion).
+    FOV_DEG = float(os.environ.get("BBAI64_CAM_FOV", "90.0"))
+    # Camera mount height above the road, metres. MUST match the z of the camera
+    # transform you attach to the ego vehicle in CARLA, or every distance is scaled.
+    CAM_HEIGHT_M = float(os.environ.get("BBAI64_CAM_HEIGHT", "1.5"))
+    # Camera pitch, degrees, POSITIVE = nose-down (toward the road); 0 = level.
+    # Static here; for braking/accel pitch, publish a per-frame value in the MQTT
+    # payload and pass it to DepthRuntime.attach_depth() later.
+    PITCH_DEG = float(os.environ.get("BBAI64_CAM_PITCH", "0.0"))
 
-    MAX_M = 80.0                      # outdoor head range; clamps label sanity
+    # ── Estimator behaviour ────────────────────────────────────
+    MAX_M = 80.0                      # absolute sanity clamp on any reported metre
+    # Monocular range error grows fast past the near/mid field; anything the
+    # geometry resolves beyond MAX_RANGE_M is reported as None ("too far to trust")
+    # rather than a confident-looking wrong number. This also absorbs the
+    # near-horizon explosion (small denominator ⇒ huge Z ⇒ rejected here).
+    MAX_RANGE_M = float(os.environ.get("BBAI64_DEPTH_MAXRANGE", "60.0"))
+    # A box within this many px of a frame edge is treated as truncated: its pixel
+    # height is unreliable for pinhole, and a bottom-clipped box has no visible
+    # ground-contact point for IPM.
+    EDGE_MARGIN_PX = 2.0
 
-    # Per-object depth sampling: median of the box's inner SHRINK fraction, so
-    # edge/background pixels and depth noise don't skew the reading (integrate.py).
-    SAMPLE_SHRINK = 0.5
+    # ── Per-class real-world HEIGHT (metres) for the pinhole estimator ─
+    # Names are the model's data.yaml classes. Defaults are rough averages —
+    # CALIBRATE against the CARLA assets you actually spawn. Unknown classes fall
+    # back to UNKNOWN_HEIGHT_M. Intra-class size variance is the accuracy floor of
+    # the pinhole path.
+    CLASS_DIMS = {
+        "vehicle":       1.5,         # passenger car body height
+        "bike":          1.6,         # bicycle + rider
+        "motobike":      1.5,         # motorcycle + rider
+        "pedestrian":    1.7,
+        "traffic_light": 0.8,         # CARLA signal head
+        "sign_30":       0.75,        # circular speed-limit sign
+        "sign_60":       0.75,
+        "sign_90":       0.75,
+    }
+    UNKNOWN_HEIGHT_M = 1.5
 
-    # Higher-opset transformer ops (LayerNorm etc.) — keep at the TIDL-safe global
-    # default; raise only if torch.onnx.export complains a needed op needs it.
-    ONNX_OPSET = ONNX_OPSET
-
-    # ViTs are quantization-sensitive: allow INT16 for depth ALONE without
-    # bumping the whole project. Defaults to the global TENSOR_BITS (INT8).
-    TENSOR_BITS = int(os.environ.get("BBAI64_DEPTH_BITS", str(TENSOR_BITS)))
-
-    # ImageNet normalization (HF processor does rescale 1/255 then normalize),
-    # applied in numpy preprocess.py on the A72 as (rgb - MEAN) * SCALE — same at
-    # calibration and runtime. NOT folded into TIDL (see the YOLO/UFLD note).
-    _IMAGENET_MEAN = [0.485, 0.456, 0.406]
-    _IMAGENET_STD = [0.229, 0.224, 0.225]
-    MEAN = [m * 255.0 for m in _IMAGENET_MEAN]
-    SCALE = [1.0 / (s * 255.0) for s in _IMAGENET_STD]
+    # Classes whose bounding-box BOTTOM rests on the road ⇒ prefer IPM (most
+    # accurate when the contact point is visible). Everything else (mounted
+    # signs/lights) uses the known-size pinhole estimator only.
+    GROUND_CONTACT = {"vehicle", "bike", "motobike", "pedestrian"}
 
 
 # ─────────────────────────────────────────────────────────────

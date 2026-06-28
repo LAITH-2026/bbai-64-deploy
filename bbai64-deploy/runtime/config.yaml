@@ -9,8 +9,11 @@ mqtt:
 
 display: imshow        # imshow | none  (live preview only; saved outputs are source-driven)
 
-depth: true            # Depth-Anything-V2 per-object distance. false => YOLO+UFLD only.
+depth: true            # Per-object distance via geometric monocular ranging (A72,
+                       # no C7x). false => YOLO+UFLD only, no depth_m field.
                        # (app.py --no-depth also disables it and wins over this.)
+                       # Camera geometry (FOV, height, pitch) + per-class real
+                       # sizes live in config.py DEPTH — set them to match CARLA.
 
 # Object-detection operating point. All optional — omit to use config.py defaults
 # (conf_default 0.40, per_class pedestrian 0.15, iou 0.45). per_class keys are

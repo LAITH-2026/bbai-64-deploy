@@ -173,8 +173,8 @@ def main() -> None:
     ap.add_argument("--display", choices=["imshow", "none"], default=_disp_default,
                     help="optional live preview window; saved artifacts are automatic")
     ap.add_argument("--no-depth", dest="depth", action="store_false",
-                    help="disable Depth-Anything-V2 (skip per-object distance; "
-                         "leaner YOLO+UFLD pipeline). Depth is ON by default.")
+                    help="skip per-object distance (geometric monocular ranging; "
+                         "A72-only, no C7x cost). Depth is ON by default.")
     ap.set_defaults(depth=C.DEPTH.ENABLED)
     ap.add_argument("--out", help="annotated output path (image/video). "
                     "Default: alongside the input as <stem>_annotated.<ext>")
@@ -225,20 +225,21 @@ def main() -> None:
             iou_thres=th.get("iou"),
         )
         ufld = UfldRuntime()
+        # Geometric distance estimator — no TIDL artifacts, A72-only (see
+        # depth_runtime.py); construction is cheap and cannot fail on the board.
         depth = DepthRuntime() if depth_enabled else None
     except Exception as e:  # noqa: BLE001
         sys.exit(f"[app] failed to load TIDL sessions: {e}\n"
                  f"      check that ./artifacts matches the board's TIDL/SDK "
                  f"version and was copied intact.")
-    print(f"[app] depth: {'ON (Depth-Anything-V2)' if depth else 'OFF'}")
+    print(f"[app] depth: {'ON (geometric monocular ranging)' if depth else 'OFF'}")
 
     print("[app] warming up ...")
     try:
         dummy = np.zeros((720, 1280, 3), dtype=np.uint8)
         yi, ym = yolo.preprocess(dummy); yolo.infer_raw(yi)
         ufld.infer_raw(ufld.preprocess(dummy))
-        if depth is not None:
-            depth.infer_raw(depth.preprocess(dummy))
+        # depth needs no warm-up: it is closed-form arithmetic, not a C7x model.
     except Exception as e:  # noqa: BLE001
         sys.exit(f"[app] warm-up inference failed: {e}\n"
                  f"      likely an artifact/firmware version mismatch or a bad "
@@ -313,9 +314,8 @@ def main() -> None:
                 tp = time.perf_counter()
                 yi, ym = yolo.preprocess(frame)
                 ui = ufld.preprocess(frame)
-                di = depth.preprocess(frame) if depth is not None else None
                 pre_ms = (time.perf_counter() - tp) * 1e3      # A72 preprocess latency
-                qB.put((idx, frame, yi, ym, ui, di, pre_ms))
+                qB.put((idx, frame, yi, ym, ui, pre_ms))
                 idx += 1
         except Exception as e:  # noqa: BLE001 — surface, don't hang
             print(f"[app] stage A (capture/preprocess) error: {e}")
@@ -330,21 +330,17 @@ def main() -> None:
                 item = qB.get()
                 if item is SENTINEL:
                     return
-                idx, frame, yi, ym, ui, di, pre_ms = item
+                idx, frame, yi, ym, ui, pre_ms = item
                 t0 = time.perf_counter()
                 y_raw = yolo.infer_raw(yi)
                 t1 = time.perf_counter()
                 u_raw = ufld.infer_raw(ui)
                 t2 = time.perf_counter()
-                if di is not None:                 # depth shares the one C7x, last
-                    d_raw = depth.infer_raw(di)
-                    t3 = time.perf_counter()
-                else:
-                    d_raw, t3 = None, t2
-                # yolo, ufld, depth, combined-C7x (all serial on the single engine)
-                timings = ((t1 - t0) * 1e3, (t2 - t1) * 1e3,
-                           (t3 - t2) * 1e3, (t3 - t0) * 1e3)
-                qC.put((idx, frame, y_raw, ym, u_raw, d_raw, pre_ms, timings))
+                # Depth is now closed-form geometry on the A72 (stage C), not a C7x
+                # model — the engine runs only yolo + ufld here.
+                # yolo, ufld, combined-C7x (serial on the single engine)
+                timings = ((t1 - t0) * 1e3, (t2 - t1) * 1e3, (t2 - t0) * 1e3)
+                qC.put((idx, frame, y_raw, ym, u_raw, pre_ms, timings))
         except Exception as e:  # noqa: BLE001
             print(f"[app] stage B (inference) error: {e}")
             stop.set()
@@ -358,16 +354,17 @@ def main() -> None:
                 item = qC.get()
                 if item is SENTINEL:
                     return
-                idx, frame, y_raw, ym, u_raw, d_raw, pre_ms, timings = item
-                yolo_ms, ufld_ms, depth_ms, c7x_ms = timings
+                idx, frame, y_raw, ym, u_raw, pre_ms, timings = item
+                yolo_ms, ufld_ms, c7x_ms = timings
                 tpost = time.perf_counter()
                 dets = yolo.decode(y_raw, ym)
                 lanes = ufld.decode(u_raw)
-                if d_raw is not None:               # per-object metric distance
-                    depth_map = depth.decode(d_raw, frame.shape[:2])
-                    depth.attach_depth(dets, depth_map)
+                td = time.perf_counter()
+                if depth is not None:               # per-object metric distance (A72)
+                    depth.attach_depth(dets, frame.shape[:2])
+                depth_ms = (time.perf_counter() - td) * 1e3     # A72 geometric ranging
                 canvas = composite(frame, dets, lanes, C.UFLD.VIS_W, C.UFLD.VIS_H)
-                post_ms = (time.perf_counter() - tpost) * 1e3   # A72 decode + composite
+                post_ms = (time.perf_counter() - tpost) * 1e3   # A72 decode + depth + composite
 
                 # JSON payload (objects + lane points, both in frame-pixel coords).
                 fh, fw = frame.shape[:2]
@@ -406,7 +403,7 @@ def main() -> None:
                 pre_st.add(pre_ms)
                 yolo_st.add(yolo_ms)
                 ufld_st.add(ufld_ms)
-                if d_raw is not None:
+                if depth is not None:
                     depth_st.add(depth_ms)
                 c7x_st.add(c7x_ms)
                 post_st.add(post_ms)
@@ -489,7 +486,7 @@ def main() -> None:
                 "source": args.source,
                 "input": str(in_path),
                 "depth_enabled": depth is not None,
-                "depth_model": C.DEPTH.HF_MODEL_ID if depth is not None else None,
+                "depth_method": C.DEPTH.METHOD if depth is not None else None,
                 "depth_unit": "metres" if depth is not None else None,
                 "frame_count": len(records),
                 "frames": records,
@@ -528,10 +525,10 @@ def main() -> None:
         f.write(yolo_st.block("yolo infer"))
         f.write("\n── UFLD C7x latency (ms) ───────────────────────────────\n")
         f.write(ufld_st.block("ufld infer"))
-        f.write("\n── Depth C7x latency (ms, Depth-Anything-V2) ───────────\n")
-        f.write(depth_st.block("depth infer") if depth_st.n else "  depth: OFF\n")
+        f.write("\n── Depth A72 latency (ms, geometric monocular ranging) ─\n")
+        f.write(depth_st.block("depth est") if depth_st.n else "  depth: OFF\n")
         f.write("\n── Combined C7x latency (ms, all models, one engine) ───\n")
-        f.write(c7x_st.block("yolo+ufld+depth"))
+        f.write(c7x_st.block("yolo+ufld"))
         f.write("\n── A72 decode+composite latency (ms, stage C) ──────────\n")
         f.write(post_st.block("decode+comp"))
         f.write("\n  NOTE: 'C7x util' is a TIME duty cycle (fraction of each frame's\n")

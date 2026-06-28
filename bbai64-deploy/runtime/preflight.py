@@ -31,10 +31,9 @@ def _dir_has_files(p: Path) -> bool:
 def check(source: str = "mqtt", depth: bool = None) -> tuple[list[str], list[str]]:
     """Return (hard_failures, warnings). Empty hard list == safe to run.
 
-    `depth` toggles the Depth-Anything-V2 artifact check; None = config default.
+    `depth` is accepted for call-site compatibility but adds no requirement: the
+    per-object distance is now closed-form geometry (no model, no TIDL artifacts).
     """
-    if depth is None:
-        depth = C.DEPTH.ENABLED
     hard: list[str] = []
     warn: list[str] = []
 
@@ -57,12 +56,11 @@ def check(source: str = "mqtt", depth: bool = None) -> tuple[list[str], list[str
         hard.append(f"onnxruntime not importable ({e})")
 
     # ── model artifacts (produced by export+compile on the PC) ─
+    # Depth is geometric (no artifacts), so only the two TIDL models are checked.
     needed = [
         ("YOLO", C.YOLO.ONNX, C.YOLO.TIDL_DIR),
         ("UFLD", C.UFLD.ONNX, C.UFLD.TIDL_DIR),
     ]
-    if depth:
-        needed.append(("DEPTH", C.DEPTH.ONNX, C.DEPTH.TIDL_DIR))
     for name, onnx, tdir in needed:
         if not Path(onnx).exists():
             hard.append(f"{name}: ONNX missing: {onnx} (run export, copy artifacts)")
@@ -94,7 +92,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", choices=["mqtt", "video", "image"], default="mqtt")
     ap.add_argument("--no-depth", dest="depth", action="store_false",
-                    help="skip the Depth-Anything-V2 artifact check")
+                    help="kept for parity with app.py; depth needs no artifacts")
     ap.set_defaults(depth=C.DEPTH.ENABLED)
     args = ap.parse_args()
 

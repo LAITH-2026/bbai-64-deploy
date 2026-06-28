@@ -83,15 +83,16 @@ in §5 — this is the single most important check.
 ```
 torch / pytorch / torchvision      ← never on the board (~2 GB, unused)
 ultralytics                        ← never; YOLO ships as a compiled artifact
-transformers / huggingface_hub     ← never; depth (Depth-Anything-V2) ships as a
-                                     compiled artifact too (PC export only)
+transformers / huggingface_hub     ← never; not needed at all (no depth model —
+                                     depth is closed-form geometry on the A72)
 edgeai-tidl-tools / onnxruntime-tidl (compile build) ← PC-only
 ```
 
-The board runs **compiled artifacts** through the runtime onnxruntime, not
-PyTorch/transformers. Keeping these out matters: the board has **4 GB RAM** shared
-with the inference buffers, and the depth ViT's working buffers are the largest of
-the three models — another reason `--no-depth` exists for tight-memory bring-up.
+The board runs **compiled artifacts** (YOLO + UFLD) through the runtime
+onnxruntime, not PyTorch/transformers, plus pure-numpy/math decode. Keeping the
+heavy stacks out matters: the board has **4 GB RAM** shared with the inference
+buffers. Depth adds essentially nothing — it is per-box arithmetic, not a model
+with working buffers — so memory is dominated by the two CNNs' TIDL buffers.
 
 ---
 

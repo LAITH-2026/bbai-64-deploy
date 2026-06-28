@@ -33,9 +33,10 @@ def build_payload(frame_idx: int, detections: List[Dict], lanes: List[Dict],
             "class_name": d["class_name"],   # from data.yaml — Qt maps by this
             "confidence": d["confidence"],
             "bbox_xyxy": d["bbox_xyxy"],
-            # Per-object metric distance (metres) from Depth-Anything-V2, or None
-            # when depth is disabled / the box yielded no valid samples. Qt uses
-            # this for distance-based ADAS warnings.
+            # Per-object metric distance (metres) from geometric monocular ranging
+            # (IPM ground-plane + known-size pinhole), or None when depth is
+            # disabled / the box is too far / truncated to estimate reliably. Qt
+            # uses this for distance-based ADAS warnings.
             "depth_m": d.get("depth_m"),
         }
         for d in detections
