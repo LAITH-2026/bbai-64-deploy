@@ -9,13 +9,34 @@ frame's native resolution so they line up with the (native-space) boxes.
 """
 from __future__ import annotations
 
-from typing import Dict, List
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # bbai64-deploy/
+import config as C  # noqa: E402
+
 LANE_COLOR = (0, 255, 0)
 BOX_COLOR = (0, 0, 255)
+
+
+def _overlay_masks(frame: np.ndarray, masks: Tuple[np.ndarray, np.ndarray]) -> None:
+    """Alpha-blend TwinLite drivable-area + lane-line binary masks onto the frame.
+    Masks are produced at the model's working resolution; they are nearest-resized
+    to the frame so they line up with the (native-space) detection boxes."""
+    da, ll = masks
+    fh, fw = frame.shape[:2]
+    if da.shape != (fh, fw):
+        da = cv2.resize(da, (fw, fh), interpolation=cv2.INTER_NEAREST)
+        ll = cv2.resize(ll, (fw, fh), interpolation=cv2.INTER_NEAREST)
+    a = C.TWINLITE.OVERLAY_ALPHA
+    for mask, color in ((da, C.TWINLITE.DA_COLOR), (ll, C.TWINLITE.LL_COLOR)):
+        sel = mask.astype(bool)
+        if sel.any():
+            frame[sel] = (frame[sel] * (1.0 - a) + np.array(color) * a).astype(frame.dtype)
 
 
 def _draw_lanes_scaled(frame: np.ndarray, lanes: List[Dict], vis_w: int, vis_h: int) -> None:
@@ -34,11 +55,17 @@ def _draw_lanes_scaled(frame: np.ndarray, lanes: List[Dict], vis_w: int, vis_h: 
 
 
 def composite(frame: np.ndarray, detections: List[Dict], lanes: List[Dict],
-              vis_w: int, vis_h: int) -> np.ndarray:
+              vis_w: int, vis_h: int,
+              masks: Optional[Tuple[np.ndarray, np.ndarray]] = None) -> np.ndarray:
     canvas = frame
     clean = frame.copy()
 
-    _draw_lanes_scaled(canvas, lanes, vis_w, vis_h)
+    # Lane visualisation: TwinLite supplies (da, ll) segmentation masks to overlay;
+    # UFLD supplies polyline lane points. Exactly one is active per run.
+    if masks is not None:
+        _overlay_masks(canvas, masks)
+    else:
+        _draw_lanes_scaled(canvas, lanes, vis_w, vis_h)
 
     fh, fw = canvas.shape[:2]
     boxes = []

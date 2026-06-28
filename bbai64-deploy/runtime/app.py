@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-bbai64 runtime — concurrent YOLO + UFLDv2 on the TDA4VM, as a 3-stage software
-pipeline (the faithful single-C7x realization of "one combined app, parallel"):
+bbai64 runtime — concurrent YOLO + lane segmentation (TwinLiteNet, or UFLDv2 via
+config.LANE_SOURCE) on the TDA4VM, as a 3-stage software pipeline (the faithful
+single-C7x realization of "one combined app, parallel"):
 
     Stage A  (thread)  capture frame  + preprocess BOTH models      [A72 + I/O]
-    Stage B  (thread)  YOLO infer, then UFLD infer                  [C7x + MMA]
-    Stage C  (thread)  NMS + pred2coords + composite + publish      [A72]
+    Stage B  (thread)  YOLO infer, then lane infer                  [C7x + MMA]
+    Stage C  (thread)  NMS + lane decode + composite + publish      [A72]
 
 Because the three stages run on different threads, the A72 decode/compositing of
 frame N overlaps the C7x inference of frame N+1 and the capture of N+2. The single
@@ -45,6 +46,7 @@ from compositor import composite         # noqa: E402
 from depth_runtime import DepthRuntime   # noqa: E402
 from frame_source import ImageFileSource, MqttFrameSource, VideoFileSource  # noqa: E402
 from ufld_runtime import UfldRuntime     # noqa: E402
+from twinlite_runtime import TwinliteRuntime  # noqa: E402
 from yolo_runtime import YoloRuntime     # noqa: E402
 
 SENTINEL = None
@@ -224,7 +226,11 @@ def main() -> None:
             conf_default=th.get("conf_default"),
             iou_thres=th.get("iou"),
         )
-        ufld = UfldRuntime()
+        # Lane stage: TwinLiteNet (seg masks, board-safe) by default, or UFLDv2
+        # (lane polylines; its 196 MB FC head resets the board). config.LANE_SOURCE
+        # / BBAI64_LANE_SOURCE selects. Both share the preprocess/infer_raw/decode
+        # interface and expose VIS_W/VIS_H for the compositor.
+        lane = TwinliteRuntime() if C.LANE_SOURCE == "twinlite" else UfldRuntime()
         # Geometric distance estimator — no TIDL artifacts, A72-only (see
         # depth_runtime.py); construction is cheap and cannot fail on the board.
         depth = DepthRuntime() if depth_enabled else None
@@ -232,13 +238,14 @@ def main() -> None:
         sys.exit(f"[app] failed to load TIDL sessions: {e}\n"
                  f"      check that ./artifacts matches the board's TIDL/SDK "
                  f"version and was copied intact.")
+    print(f"[app] lane source: {C.LANE_SOURCE}")
     print(f"[app] depth: {'ON (geometric monocular ranging)' if depth else 'OFF'}")
 
     print("[app] warming up ...")
     try:
         dummy = np.zeros((720, 1280, 3), dtype=np.uint8)
         yi, ym = yolo.preprocess(dummy); yolo.infer_raw(yi)
-        ufld.infer_raw(ufld.preprocess(dummy))
+        lane.infer_raw(lane.preprocess(dummy))
         # depth needs no warm-up: it is closed-form arithmetic, not a C7x model.
     except Exception as e:  # noqa: BLE001
         sys.exit(f"[app] warm-up inference failed: {e}\n"
@@ -313,7 +320,7 @@ def main() -> None:
                     continue                 # MQTT idle — keep waiting
                 tp = time.perf_counter()
                 yi, ym = yolo.preprocess(frame)
-                ui = ufld.preprocess(frame)
+                ui = lane.preprocess(frame)
                 pre_ms = (time.perf_counter() - tp) * 1e3      # A72 preprocess latency
                 qB.put((idx, frame, yi, ym, ui, pre_ms))
                 idx += 1
@@ -334,7 +341,7 @@ def main() -> None:
                 t0 = time.perf_counter()
                 y_raw = yolo.infer_raw(yi)
                 t1 = time.perf_counter()
-                u_raw = ufld.infer_raw(ui)
+                u_raw = lane.infer_raw(ui)
                 t2 = time.perf_counter()
                 # Depth is now closed-form geometry on the A72 (stage C), not a C7x
                 # model — the engine runs only yolo + ufld here.
@@ -358,17 +365,20 @@ def main() -> None:
                 yolo_ms, ufld_ms, c7x_ms = timings
                 tpost = time.perf_counter()
                 dets = yolo.decode(y_raw, ym)
-                lanes = ufld.decode(u_raw)
+                lanes = lane.decode(u_raw)
                 td = time.perf_counter()
                 if depth is not None:               # per-object metric distance (A72)
                     depth.attach_depth(dets, frame.shape[:2])
                 depth_ms = (time.perf_counter() - td) * 1e3     # A72 geometric ranging
-                canvas = composite(frame, dets, lanes, C.UFLD.VIS_W, C.UFLD.VIS_H)
+                # TwinLite supplies seg masks (last_masks); UFLD supplies lane points.
+                lane_masks = getattr(lane, "last_masks", None)
+                canvas = composite(frame, dets, lanes, lane.VIS_W, lane.VIS_H,
+                                   masks=lane_masks)
                 post_ms = (time.perf_counter() - tpost) * 1e3   # A72 decode + depth + composite
 
                 # JSON payload (objects + lane points, both in frame-pixel coords).
                 fh, fw = frame.shape[:2]
-                payload = build_payload(idx, dets, lanes, fw, fh, C.UFLD.VIS_W, C.UFLD.VIS_H)
+                payload = build_payload(idx, dets, lanes, fw, fh, lane.VIS_W, lane.VIS_H)
                 if adas is not None:                # live stream → MQTT to Qt
                     adas.publish(payload)
                 else:                               # offline → accumulate for JSON file

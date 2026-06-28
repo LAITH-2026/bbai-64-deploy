@@ -91,6 +91,11 @@ class YOLO:
     PT = MODEL_DIR / "best.pt"                   # source weights (PC only)
     DATA_YAML = MODEL_DIR / "data.yaml"          # class names live here (single source)
     ONNX = ARTIFACTS / f"{NAME}.onnx"
+    # Head-truncated export (6 raw detection-conv outputs, no DFL/Reshape head).
+    # The board's 0x20250429 TIDL firmware can't verify yolo26n's Reshape head, so
+    # the C7x runs backbone+conv-heads only and the anchor decode runs in numpy on
+    # the A72 (yolo_runtime). The runtime auto-prefers this file when it exists.
+    TRUNC_ONNX = ARTIFACTS / f"{NAME}_trunc.onnx"
     TIDL_DIR = ARTIFACTS / "yolo_tidl"           # TIDL artifacts folder
     # Square letterbox input. The fine-tuned model was TRAINED @1280 (that is what
     # made small speed-sign detection work — docs headline), but 1280 is ~4x the
@@ -141,6 +146,11 @@ class UFLD:
     CONFIG = UFLD_ROOT / "configs" / "culane_res18.py"   # PC export only
     WEIGHTS = UFLD_ROOT / "culane_res18.pth"             # PC export only
     ONNX = ARTIFACTS / "ufld_culane_res18.onnx"
+    # Head-truncated export (single flat `linear_1` [1,91224] output); the board's
+    # 0x20250429 TIDL can't verify the 4x Slice+Reshape head, so it runs in numpy
+    # on the A72 (ufld_runtime). Runtime auto-prefers this when present. NOTE it
+    # references the same external ufld_culane_res18.onnx.data as the full model.
+    TRUNC_ONNX = ARTIFACTS / "ufld_culane_res18_trunc.onnx"
     TIDL_DIR = ARTIFACTS / "ufld_tidl"
 
     DATASET = "CULane"
@@ -177,6 +187,42 @@ class UFLD:
     _IMAGENET_STD = [0.229, 0.224, 0.225]
     MEAN = [m * 255.0 for m in _IMAGENET_MEAN]
     SCALE = [1.0 / (s * 255.0) for s in _IMAGENET_STD]
+
+
+# ─────────────────────────────────────────────────────────────
+# TWINLITE — lane line + drivable-area segmentation (REPLACES UFLDv2).
+#
+# UFLDv2's 196 MB FC head subgraph resets the board's C7x; TwinLiteNet is a tiny
+# (0.4 M-param) ESPNet-C encoder + 2 ConvTranspose decoder heads that offloads
+# 127/127 nodes and runs at ~70 FPS with no reset. We compile the ATTENTION-FREE
+# export (twinlite_noattn.onnx): the Dual-Attention (PAM/CAM) ReduceMax/Sub/Expand
+# ops hang the 11_00_06 perfsim, and removing them is near-lossless. Two raw-logit
+# outputs da/ll [1,2,H,W]; decode = numpy argmax over the 2-channel axis on the A72.
+#
+# Selected as the lane stage when LANE_SOURCE == "twinlite" (default). Set to
+# "ufld" to fall back to the (board-resetting) UFLD path.
+#
+# ACCURACY NOTE: on this 0x20250429 firmware TIDL mis-quantises the decoder's
+# ConvTranspose (logits overflow), so the masks are saturated/inaccurate pending a
+# decoder retrain (Resize+Conv) — see TWINLITE_RETRAIN_HANDOFF.md. Latency/FPS KPIs
+# are valid; mask geometry is not yet deployment-accurate.
+# ─────────────────────────────────────────────────────────────
+LANE_SOURCE = os.environ.get("BBAI64_LANE_SOURCE", "twinlite")   # "twinlite" | "ufld"
+
+
+class TWINLITE:
+    ONNX = ARTIFACTS / "twinlite_noattn.onnx"    # attention-free conv-only export
+    TIDL_DIR = ARTIFACTS / "twinlite_tidl"        # TIDL artifacts folder
+    TWIN_W = 640
+    TWIN_H = 360
+    # Decode: argmax over the 2-ch logit axis → binary masks. A pixel is positive
+    # when channel-1 (foreground) beats channel-0 (background).
+    DA_OUTPUT = "da"          # drivable-area head  [1,2,H,W]
+    LL_OUTPUT = "ll"          # lane-line head      [1,2,H,W]
+    # Overlay colours (BGR) when compositing the masks onto the frame.
+    DA_COLOR = (0, 128, 0)    # green drivable area
+    LL_COLOR = (0, 0, 255)    # red lane lines
+    OVERLAY_ALPHA = 0.40
 
 
 # ─────────────────────────────────────────────────────────────

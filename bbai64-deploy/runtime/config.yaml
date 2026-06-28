@@ -9,6 +9,11 @@ mqtt:
 
 display: imshow        # imshow | none  (live preview only; saved outputs are source-driven)
 
+# Lane stage = TwinLiteNet (seg masks) by default; UFLDv2 (polylines) resets the
+# board and is kept only as a fallback. Selected by config.py LANE_SOURCE /
+# BBAI64_LANE_SOURCE env (not read from this file). To use UFLD:
+#   export BBAI64_LANE_SOURCE=ufld
+
 depth: true            # Per-object distance via geometric monocular ranging (A72,
                        # no C7x). false => YOLO+UFLD only, no depth_m field.
                        # (app.py --no-depth also disables it and wins over this.)

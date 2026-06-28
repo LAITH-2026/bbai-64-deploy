@@ -56,11 +56,20 @@ def check(source: str = "mqtt", depth: bool = None) -> tuple[list[str], list[str
         hard.append(f"onnxruntime not importable ({e})")
 
     # ── model artifacts (produced by export+compile on the PC) ─
-    # Depth is geometric (no artifacts), so only the two TIDL models are checked.
-    needed = [
-        ("YOLO", C.YOLO.ONNX, C.YOLO.TIDL_DIR),
-        ("UFLD", C.UFLD.ONNX, C.UFLD.TIDL_DIR),
-    ]
+    # Depth is geometric (no artifacts). Lane stage is YOLO + the active lane model
+    # (TwinLite by default, or UFLD via config.LANE_SOURCE). Check the ONNX the
+    # runtime actually loads: YOLO/UFLD prefer their head-truncated export when it
+    # exists (the board's TIDL can't verify the full head), so accept trunc first.
+    def _effective(full, trunc=None):
+        return trunc if (trunc is not None and Path(trunc).exists()) else full
+
+    needed = [("YOLO", _effective(C.YOLO.ONNX, getattr(C.YOLO, "TRUNC_ONNX", None)),
+               C.YOLO.TIDL_DIR)]
+    if C.LANE_SOURCE == "twinlite":
+        needed.append(("TWINLITE", C.TWINLITE.ONNX, C.TWINLITE.TIDL_DIR))
+    else:
+        needed.append(("UFLD", _effective(C.UFLD.ONNX, getattr(C.UFLD, "TRUNC_ONNX", None)),
+                       C.UFLD.TIDL_DIR))
     for name, onnx, tdir in needed:
         if not Path(onnx).exists():
             hard.append(f"{name}: ONNX missing: {onnx} (run export, copy artifacts)")

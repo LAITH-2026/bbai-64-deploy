@@ -2,8 +2,9 @@
 
 **Audience:** the Embedded Linux engineer building the custom image.
 **Goal:** produce an image that can run `bbai64-deploy/runtime/` natively — two
-ML models (YOLO + UFLDv2) on the **C7x+MMA via TIDL**, fed by MQTT, with no
-PyTorch on the device.
+ML models (YOLO + TwinLiteNet lane/drivable-area seg) on the **C7x+MMA via TIDL**,
+fed by MQTT, with no PyTorch on the device. (Depth is closed-form A72 geometry, not
+a model; UFLDv2 remains only as a fallback lane source.)
 
 This is **native-first** (no Docker yet). Containerization is a later, additive
 step and does not change anything below.
@@ -88,7 +89,7 @@ transformers / huggingface_hub     ← never; not needed at all (no depth model 
 edgeai-tidl-tools / onnxruntime-tidl (compile build) ← PC-only
 ```
 
-The board runs **compiled artifacts** (YOLO + UFLD) through the runtime
+The board runs **compiled artifacts** (YOLO + TwinLiteNet) through the runtime
 onnxruntime, not PyTorch/transformers, plus pure-numpy/math decode. Keeping the
 heavy stacks out matters: the board has **4 GB RAM** shared with the inference
 buffers. Depth adds essentially nothing — it is per-box arithmetic, not a model

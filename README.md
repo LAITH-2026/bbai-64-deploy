@@ -1,12 +1,13 @@
 # bbai-64-deploy
 
 On-board deployment of a three-feature perception stack — **object detection**
-(fine-tuned YOLO), **lane detection** (UFLDv2), and **monocular metric depth**
-(per-object distance in metres, by closed-form camera geometry) — for the
-**BeagleBone AI-64 (TI TDA4VM)**. The two CNNs run on the **C7x+MMA** accelerator
-via **TIDL**; depth is **A72 geometry, not a model** (Depth-Anything-V2 was a ViT
-TIDL couldn't offload — see `bbai64-deploy/README.md`). Fed by **MQTT frames from
-CARLA**.
+(fine-tuned YOLO), **lane + drivable-area segmentation** (TwinLiteNet), and
+**monocular metric depth** (per-object distance in metres, by closed-form camera
+geometry) — for the **BeagleBone AI-64 (TI TDA4VM)**. The two CNNs run on the
+**C7x+MMA** accelerator via **TIDL**; depth is **A72 geometry, not a model**
+(Depth-Anything-V2 was a ViT TIDL couldn't offload — see `bbai64-deploy/README.md`).
+TwinLiteNet replaces UFLDv2, whose 196 MB FC head reset the board (UFLDv2 kept as a
+`BBAI64_LANE_SOURCE=ufld` fallback). Fed by **MQTT frames from CARLA**.
 
 This repository is a **self-contained slice** of the larger "Connected Intelligent
 Vehicle Platform" graduation project: the deploy code plus exactly the
@@ -59,12 +60,13 @@ See [`bbai64-deploy/README.md`](bbai64-deploy/README.md) for the full run order.
 In brief, on an x86_64 Linux / WSL2 PC:
 
 ```bash
-# (fetch culane_res18.pth into Ultra-Fast-Lane-Detection-v2/ first)
 python bbai64-deploy/export/export_yolo_onnx.py
-python bbai64-deploy/export/export_ufld_onnx.py
+python bbai64-deploy/export/export_twinlite_onnx.py   # lane (needs TwinLiteNet src)
+python bbai64-deploy/export/truncate_onnx.py          # head-truncate for board TIDL
 python bbai64-deploy/compile/prepare_calib.py --video <carla_clip.mp4> --n 25
 python bbai64-deploy/compile/compile_yolo_tidl.py
-python bbai64-deploy/compile/compile_ufld_tidl.py
+python bbai64-deploy/compile/compile_twinlite_tidl.py
 #   → copy bbai64-deploy/artifacts/ to the board, then:  python3 runtime/app.py
 #   (depth = A72 geometry; no export/compile, just set config.py DEPTH for CARLA)
+#   UFLD fallback lane model: export_ufld_onnx.py (+ culane_res18.pth) → truncate_onnx.py
 ```

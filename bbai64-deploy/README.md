@@ -1,12 +1,22 @@
-# bbai64-deploy — YOLO + UFLDv2 + geometric depth on BeagleBone AI-64 (TDA4VM)
+# bbai64-deploy — YOLO + TwinLiteNet + geometric depth on BeagleBone AI-64 (TDA4VM)
 
 Deploys the three graduation-project ML features — **object detection** (YOLO,
-the fine-tuned 8-class CARLA model in `Fined-Tuned-Model/`), **lane detection**
-(UFLDv2), and **monocular metric depth** (per-object distance in metres) — onto
-the BeagleBone AI-64's TDA4VM. The two CNNs run on the **C7x+MMA deep-learning
-accelerator** via TIDL; depth is **closed-form camera geometry on the A72** (no
-network — see below). Fed by **MQTT frames from CARLA**, rendering to a display
-and publishing **ADAS alerts** for the Qt infotainment.
+the fine-tuned 8-class CARLA model in `Fined-Tuned-Model/`), **lane + drivable-area
+segmentation** (TwinLiteNet), and **monocular metric depth** (per-object distance
+in metres) — onto the BeagleBone AI-64's TDA4VM. The two CNNs run on the **C7x+MMA
+deep-learning accelerator** via TIDL; depth is **closed-form camera geometry on the
+A72** (no network — see below). Fed by **MQTT frames from CARLA**, rendering to a
+display and publishing **ADAS alerts** for the Qt infotainment.
+
+> **Why TwinLiteNet, not UFLDv2.** UFLDv2's 196 MB fully-connected head compiles to
+> a TIDL subgraph that **resets the board's C7x**. TwinLiteNet is a tiny
+> (0.4 M-param) conv-only segmentation net that offloads 127/127 nodes and runs at
+> ~70 FPS with no reset. It emits two segmentation masks (drivable area + lane
+> lines) instead of lane polylines. UFLDv2 is kept as a fallback behind
+> `config.LANE_SOURCE` / `BBAI64_LANE_SOURCE=ufld`. **Accuracy caveat:** on the
+> current board firmware TIDL mis-quantises TwinLite's ConvTranspose decoder, so
+> the masks are saturated pending a decoder retrain (Resize+Conv) — FPS/latency are
+> valid, mask geometry is not yet deployment-accurate.
 
 On-device successor to `Integrate-Features/integrate.py` (which ran all three
 models sequentially on a Windows CUDA GPU). Depth is **ON by default** and adds a
@@ -57,21 +67,22 @@ So "running all three concurrently" on this chip = a **3-stage software pipeline
 ```
 ┌──────────────────── x86_64 Linux / WSL2 (your PC) ─────────────────────┐
 │ 1. EXPORT    PyTorch → ONNX (fixed shape, batch 1)                       │
-│    export/export_yolo_onnx.py  → artifacts/yolo26n_carla8.onnx           │
-│    export/export_ufld_onnx.py  → artifacts/ufld_culane_res18.onnx        │
+│    export/export_yolo_onnx.py     → artifacts/yolo26n_carla8.onnx        │
+│    export/export_twinlite_onnx.py → artifacts/twinlite_noattn.onnx       │
+│    (export_ufld_onnx.py still here for the UFLD fallback)                │
 │    (depth has no export step — it is geometry, not a model)              │
 │                                                                          │
 │ 2. COMPILE   ONNX → TIDL artifacts (INT8 PTQ + calibration)              │
-│    compile/prepare_calib.py     → calib/*.jpg (frames from a CARLA clip) │
-│    compile/compile_yolo_tidl.py → artifacts/yolo_tidl/                   │
-│    compile/compile_ufld_tidl.py → artifacts/ufld_tidl/                   │
+│    compile/prepare_calib.py         → calib/*.jpg (CARLA-clip frames)    │
+│    compile/compile_yolo_tidl.py     → artifacts/yolo_tidl/               │
+│    compile/compile_twinlite_tidl.py → artifacts/twinlite_tidl/           │
 └──────────────────────────────────────────────────────────────────────── ┘
                               │  copy ./artifacts to the board
                               ▼
 ┌─────────────────────── BeagleBone AI-64 (native) ──────────────────────┐
 │ 3. RUNTIME   onnxruntime + TIDLExecutionProvider, 3-stage pipeline       │
-│    MQTT(CARLA) → preprocess → [C7x: YOLO, then UFLD] → numpy decode       │
-│    (NMS · pred2coords · per-box depth geometry) → composite overlay →     │
+│    MQTT(CARLA) → preprocess → [C7x: YOLO, then TwinLite] → numpy decode   │
+│    (NMS · seg-mask argmax · per-box depth geometry) → composite overlay → │
 │    display  +  ADAS alerts (+depth_m) → MQTT (Qt infotainment)           │
 │    runtime/app.py                                                        │
 └────────────────────────────────────────────────────────────────────────┘
@@ -125,10 +136,13 @@ The model identity is **data-driven**, not hard-coded:
   compile → copy artifacts (the `data.yaml` ships with them). Per-class
   confidence lives in `config.py` (`PER_CLASS_CONF` / `CONF_DEFAULT`) and is
   overridable at runtime via `runtime/config.yaml` `thresholds:`.
-- **UFLD** — repoint `UFLD.WEIGHTS` / `UFLD.CONFIG` in `config.py`. ⚠️ the head
-  geometry constants in `config.py` (`NUM_ROW`, anchors, `CROP_RATIO`, …) are a
-  hand-copy of `configs/culane_res18.py`; if you retrain with a different
-  backbone/anchors, update them to match (still a single file to edit).
+- **Lane (TwinLiteNet)** — re-export with `export/export_twinlite_onnx.py` (needs
+  the TwinLiteNet source — see that script) and recompile. The board runtime reads
+  the two seg heads by name (`config.TWINLITE.DA_OUTPUT` / `LL_OUTPUT`); overlay
+  colours/alpha and the working size (`TWIN_W`/`TWIN_H`) live in `config.TWINLITE`.
+  The **UFLD** fallback (`BBAI64_LANE_SOURCE=ufld`) still works: repoint
+  `UFLD.WEIGHTS` / `UFLD.CONFIG` and the head-geometry constants (`NUM_ROW`,
+  anchors, `CROP_RATIO`, …) in `config.py` to match a retrain.
 - **Depth** — no model to swap. Tune the camera geometry and per-class sizes in
   `config.py` (`class DEPTH`): `FOV_DEG`, `CAM_HEIGHT_M`, `PITCH_DEG` (or the
   `BBAI64_CAM_*` env vars) must match the CARLA camera you spawn, and `CLASS_DIMS`
@@ -138,15 +152,27 @@ The model identity is **data-driven**, not hard-coded:
 
 ## Model facts (from the existing codebase)
 
-| | YOLO (fine-tuned yolo26n, 8-class CARLA) | UFLDv2 (CULane res18) | Depth (geometric monocular) |
+| | YOLO (fine-tuned yolo26n, 8-class CARLA) | TwinLiteNet (lane + drivable)² | Depth (geometric monocular) |
 |---|---|---|---|
-| ONNX input | `1×3×640×640`¹ | `1×3×320×1600` | — (no model) |
-| Graph | conv backbone + detect head | ResNet-18 + Conv(512→8) + LayerNorm + MLP | closed-form IPM + pinhole |
-| Output | raw head `[1,84,8400]` | 4 head tensors | one metric distance per YOLO box |
-| On C7x (TIDL) | whole backbone+head | whole net | **nothing** (A72 only) |
-| On A72 (numpy) | NMS / box decode | `pred2coords` argmax+softmax decode | per-box distance from camera geometry |
-| Preprocess | letterbox, RGB, /255 | resize→(533,1600), crop bottom 320, RGB, ImageNet norm | — (consumes boxes, not pixels) |
-| Op(s) to watch | — | `LayerNorm` (fc_norm) | flat-ground + known-size assumptions; range cap `MAX_RANGE_M`; pitch sensitivity |
+| ONNX input | `1×3×640×640`¹ | `1×3×360×640` | — (no model) |
+| Graph | conv backbone + conv detect heads (DFL/Reshape head **truncated**³) | ESPNet-C encoder + 2 ConvTranspose seg heads (attention removed) | closed-form IPM + pinhole |
+| Output | 6 raw conv heads (3× box`[1,4,H,W]` + 3× cls`[1,nc,H,W]`)³ | `da`,`ll` each `[1,2,H,W]` logits | one metric distance per YOLO box |
+| On C7x (TIDL) | backbone + conv heads (no DFL/Reshape) | whole net (127/127 nodes, ~70 FPS) | **nothing** (A72 only) |
+| On A72 (numpy) | anchor decode (dist2bbox + sigmoid) + NMS | argmax over 2-ch axis → 2 binary masks | per-box distance from camera geometry |
+| Preprocess | letterbox, RGB, /255 | resize 640×360, RGB, /255 (no ImageNet norm) | — (consumes boxes, not pixels) |
+| Op(s) to watch | DFL/Reshape head unverifiable on this firmware → truncated³ | **ConvTranspose** mis-quantised on current firmware → saturated masks (pending Resize+Conv retrain) | flat-ground + known-size assumptions; range cap `MAX_RANGE_M`; pitch sensitivity |
+
+² TwinLiteNet replaces UFLDv2 (whose 196 MB FC head resets the board). UFLDv2 is
+kept as a fallback via `config.LANE_SOURCE` / `BBAI64_LANE_SOURCE=ufld`
+(input `1×3×320×1600`, ResNet-18 + `pred2coords` polyline decode).
+
+³ **Head truncation.** The board's `0x20250429` TIDL firmware can't *verify* two
+head subgraphs — yolo26n's DFL/Reshape detect head and (in the UFLD fallback) its
+4× Slice+Reshape head. So `export/truncate_onnx.py` cuts both ONNX at the last
+verifiable tensor (YOLO: the 6 conv outputs; UFLD: the flat `linear_1`), the C7x
+runs everything up to the cut, and the head runs in numpy on the A72
+(`yolo_runtime._decode_truncated` / `ufld_runtime`). The runtimes auto-prefer the
+`*_trunc.onnx` (`config.*.TRUNC_ONNX`) when present, else use the full model.
 
 ¹ YOLO input is a **user choice** (`BBAI64_YOLO_IMGSZ`, default 640). The fine-tuned
 model was trained @1280 — set `1280` (or `960`) before export+compile for best
@@ -164,12 +190,16 @@ compile config — adding mean/scale there would double-normalize and wreck accu
 ```bash
 # ── PC (x86_64 Linux / WSL2) ──
 python export/export_yolo_onnx.py
-python export/export_ufld_onnx.py
+python export/export_twinlite_onnx.py   # lane; see script (needs TwinLiteNet src)
+python export/truncate_onnx.py          # YOLO head-truncation (board TIDL can't
+                                        # verify the DFL/Reshape head; see below)
 python compile/prepare_calib.py --video /path/to/carla_clip.mp4 --n 25
-python compile/compile_yolo_tidl.py
-python compile/compile_ufld_tidl.py
+python compile/compile_yolo_tidl.py     # compiles the *_trunc.onnx (auto-preferred)
+python compile/compile_twinlite_tidl.py
 #   → copy ./artifacts to the board (e.g. scp -r artifacts debian@bbai64:~/bbai64-deploy/)
 #   (depth has no export/compile step — it is A72 geometry, set in config.py)
+#   UFLD fallback: export_ufld_onnx.py → truncate_onnx.py → compile_ufld_tidl.py,
+#     then run with BBAI64_LANE_SOURCE=ufld (UFLD resets the board — see top note).
 
 # Optional: bump YOLO resolution before export+compile (keep set at runtime too)
 #   export BBAI64_YOLO_IMGSZ=1280
@@ -177,8 +207,8 @@ python compile/compile_ufld_tidl.py
 # ── Board (BeagleBone AI-64) ──
 #   First set the camera geometry to match CARLA (config.py DEPTH or env):
 #   export BBAI64_CAM_FOV=90  BBAI64_CAM_HEIGHT=1.5  BBAI64_CAM_PITCH=0
-python3 runtime/app.py            # or ./run_native.sh   (depth ON by default)
-python3 runtime/app.py --no-depth # YOLO + UFLD only (drops the depth_m field)
+python3 runtime/app.py            # or ./run_native.sh   (TwinLite lane + depth ON)
+python3 runtime/app.py --no-depth # drops the depth_m field
 ```
 
 ---
@@ -206,10 +236,11 @@ The runtime documents performance two ways: a **per-frame** log
 (`runtime/runtime_kpis.csv`, flushed every frame) and an **end-of-run** summary
 (`runtime/runtime_analytics.txt`, min/max/avg/p95/p99). Metrics cover throughput
 (avg + per-frame FPS, inference-bound ceiling), C7x/MMA utilization (duty cycle),
-the full latency breakdown (A72 preprocess · YOLO · UFLD · **Depth (A72)** · A72
-decode+composite), and memory (RSS avg/peak). The combined-C7x line is `yolo+ufld`
-(depth is not on the C7x); the per-frame CSV keeps a `depth_ms` column, now the
-A72 cost of the per-box geometry (part of the decode/composite stage).
+the full latency breakdown (A72 preprocess · YOLO · lane · **Depth (A72)** · A72
+decode+composite), and memory (RSS avg/peak). The combined-C7x line is the two CNNs
+(depth is not on the C7x); the per-frame CSV keeps a `depth_ms` column (now the A72
+cost of the per-box geometry) — the lane-timing column is still named `ufld_ms`
+regardless of `LANE_SOURCE`.
 
 **What every KPI means, what it clarifies, and its honest limits is documented in
 [docs/06-onboard-kpis.md](../docs/06-onboard-kpis.md).**

@@ -64,6 +64,22 @@ def preprocess_ufld(bgr: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(chw, dtype=np.float32)
 
 
+# ─────────────────────────────────────────────────────────────
+# TwinLiteNet — plain resize to (TWIN_W × TWIN_H), RGB, /255, NCHW.
+# Lane + drivable-area segmentation replacing UFLDv2 (which resets the board with
+# its 196 MB FC subgraph). The attention-free conv-only net (twinlite_noattn.onnx)
+# offloads 127/127 nodes to the C7x. No ImageNet normalisation — the model was
+# trained on a bare /255 scale, matching the BDD100K TwinLite recipe.
+# ─────────────────────────────────────────────────────────────
+def preprocess_twinlite(bgr: np.ndarray) -> np.ndarray:
+    """Returns input[1,3,TWIN_H,TWIN_W] float32 in [0,1] (RGB, NCHW)."""
+    resized = cv2.resize(bgr, (C.TWINLITE.TWIN_W, C.TWINLITE.TWIN_H),
+                         interpolation=cv2.INTER_LINEAR)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    chw = np.transpose(rgb, (2, 0, 1))[None]
+    return np.ascontiguousarray(chw, dtype=np.float32)
+
+
 # NOTE: there is no preprocess_depth anymore. Per-object distance is closed-form
 # monocular geometry on the A72 (runtime/depth_runtime.py): it consumes YOLO boxes
 # + camera geometry, not a preprocessed image tensor, so no depth model is
